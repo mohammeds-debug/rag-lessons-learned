@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: arxiv-rag-backend
+    ports:
+      - "5001:5000"
+    environment:
+      - FASTAPI_ENV=${FASTAPI_ENV:-production}
+      - PINECONE_API_KEY=${PINECONE_API_KEY}
+      - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-arxiv-rag}
+      - CLIENT_TO_BE_USED=${CLIENT_TO_BE_USED:-gemini}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_KEY=${AZURE_OPENAI_KEY}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - AZURE_AI_CHAT_ENDPOINT=${AZURE_AI_CHAT_ENDPOINT}
+      - AZURE_AI_CHAT_API_KEY=${AZURE_AI_CHAT_API_KEY}
+      - AZURE_AI_CHAT_MODEL=${AZURE_AI_CHAT_MODEL:-gpt-4o-mini}
+      - AZURE_AI_CHAT_API_VERSION=${AZURE_AI_CHAT_API_VERSION:-2024-02-15-preview}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - AUTO_INDEX_ON_STARTUP=${AUTO_INDEX_ON_STARTUP:-false}
+      - DATA_DIR=/data
+      - DEFAULT_SEARCH_RESULTS_K=${DEFAULT_SEARCH_RESULTS_K:-5}
+      - MAX_SEARCH_RESULTS_K=${MAX_SEARCH_RESULTS_K:-20}
+      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2:-false}
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT:-arxiv-rag}
+      - LANGCHAIN_ENDPOINT=${LANGCHAIN_ENDPOINT:-https://api.smith.langchain.com}
+    volumes:
+      - ./data:/data
+      - ./backend/conversations.db:/app/conversations.db
+    networks:
+      - arxiv-rag-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: arxiv-rag-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - arxiv-rag-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  arxiv-rag-network:
+    driver: bridge

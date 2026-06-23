@@ -1,0 +1,29 @@
+# Web Framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# AI/ML Libraries
+httpx>=0.27.0
+openai>=1.30.0
+google-genai>=1.0.0
+slowapi>=0.1.9
+langsmith>=0.1.147
+
+# Vector Database
+pinecone>=5.0.0
+
+# Document Processing
+pypdf>=3.17.0
+langdetect>=1.0.9
+pymupdf>=1.23.0
+llama-index>=0.11.0
+llama-index-embeddings-openai>=0.2.0
+llama-index-embeddings-azure-openai>=0.2.0
+llama-index-llms-openai>=0.2.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# arXiv paper downloader (for scripts/fetch_papers.py)
+arxiv>=2.1.0

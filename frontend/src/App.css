@@ -1,0 +1,331 @@
+.App {
+  min-height: 100vh;
+  color: #ffffff;
+  background-color: #0a0a0a;
+}
+
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+.header {
+  padding: 1rem 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: rgba(10, 10, 10, 0.95);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.app-branding {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.app-title {
+  color: #ffffff;
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: -0.5px;
+}
+
+.app-subtitle {
+  color: #666;
+  font-size: 0.75rem;
+  margin: 0;
+}
+
+.header-left {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.hamburger-btn {
+  background: transparent;
+  border: 2px solid #6366f1;
+  color: #6366f1;
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  padding: 0;
+}
+
+.hamburger-btn:hover {
+  background: #6366f1;
+  color: #ffffff;
+}
+
+.hamburger-icon { font-size: 20px; line-height: 1; }
+
+.header-actions {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.new-session-btn {
+  background: transparent;
+  color: white;
+  border: 2px solid #6366f1;
+  padding: 0.6rem 1.2rem;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.new-session-btn:hover {
+  background: #6366f1;
+  transform: translateY(-1px);
+}
+
+.main-content {
+  display: grid;
+  grid-template-columns: 1fr 300px;
+  gap: 2rem;
+  min-height: 60vh;
+}
+
+@media (max-width: 1024px) {
+  .main-content { grid-template-columns: 1fr; }
+}
+
+.content-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  position: relative;
+  min-height: 60vh;
+}
+
+.content-wrapper.has-messages {
+  height: calc(100vh - 180px);
+}
+
+.welcome-section {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  min-height: 50vh;
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+
+.welcome-greeting {
+  font-size: 1.2rem;
+  font-weight: 400;
+  color: #666;
+  margin: 0 0 0.5rem 0;
+}
+
+.welcome-question {
+  font-size: 2.8rem;
+  font-weight: 500;
+  color: #ffffff;
+  margin: 0 0 3rem 0;
+  line-height: 1.2;
+}
+
+@media (max-width: 768px) {
+  .welcome-question { font-size: 2rem; }
+}
+
+.warning-message {
+  background: #1a1200;
+  color: #fbbf24;
+  padding: 1rem 1.25rem;
+  border-radius: 10px;
+  border: 1px solid #2d2100;
+  font-size: 0.9rem;
+}
+
+.warning-message code {
+  background: #2d2100;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-family: monospace;
+}
+
+.messages-container {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  overflow-y: auto;
+  padding-right: 0.5rem;
+  flex: 1;
+  min-height: 0;
+}
+
+.messages-container::-webkit-scrollbar { width: 6px; }
+.messages-container::-webkit-scrollbar-track { background: #111; border-radius: 4px; }
+.messages-container::-webkit-scrollbar-thumb { background: #6366f1; border-radius: 4px; }
+
+.message { animation: fadeIn 0.25s ease-in; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.user-message {
+  background: #0f0f1a;
+  padding: 1rem 1.5rem;
+  border-radius: 14px;
+  border: 1px solid #6366f1;
+  align-self: flex-end;
+  max-width: 80%;
+}
+
+.message-content { color: #ffffff; line-height: 1.6; }
+
+.assistant-message { width: 100%; }
+
+.error-message {
+  background: #1a0000;
+  color: #f87171;
+  padding: 1rem;
+  border-radius: 10px;
+  border: 1px solid #2d0000;
+}
+
+.loading-indicator {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem;
+  color: #666;
+}
+
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid #222;
+  border-top-color: #6366f1;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.footer {
+  text-align: center;
+  padding: 1.5rem;
+  margin-top: 1rem;
+  border-top: 1px solid #1a1a1a;
+}
+
+.footer-disclaimer {
+  color: #555;
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.error-toast {
+  position: fixed;
+  bottom: 2rem;
+  right: 2rem;
+  background: #1a0000;
+  color: #f87171;
+  padding: 1rem 1.5rem;
+  border-radius: 10px;
+  border: 1px solid #2d0000;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  z-index: 1000;
+  animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+.error-toast button {
+  background: none;
+  border: none;
+  color: #f87171;
+  font-size: 1.4rem;
+  cursor: pointer;
+  padding: 0;
+}
+
+.search-input-fixed {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: rgba(10, 10, 10, 0.97);
+  backdrop-filter: blur(10px);
+  padding: 1rem;
+  border-top: 1px solid #1a1a1a;
+  z-index: 50;
+}
+
+.search-input-fixed .search-input-container {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.sidebar {
+  background: #0d0d0d;
+  border-left: 1px solid #1a1a1a;
+  padding: 1.5rem;
+  height: 100vh;
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 300px;
+  max-width: 85vw;
+  transition: transform 0.3s ease;
+  transform: translateX(100%);
+  z-index: 999;
+  overflow-y: auto;
+  padding-top: 3rem;
+}
+
+.sidebar.sidebar-open { transform: translateX(0); }
+
+.sidebar-close-btn {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  background: transparent;
+  border: 1px solid #6366f1;
+  color: #6366f1;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+  padding: 0;
+  transition: all 0.2s ease;
+}
+
+.sidebar-close-btn:hover { background: #6366f1; color: white; }
+
+.sidebar-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 998;
+  backdrop-filter: blur(4px);
+}

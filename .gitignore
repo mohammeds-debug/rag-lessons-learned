@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Data (PDFs and index metadata — user-specific)
+data/*.pdf
+.pinecone_metadata/
+
+# Database
+*.db
+
+# Node
+node_modules/
+frontend/build/
+
+# Docker
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
