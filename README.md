@@ -140,6 +140,171 @@ healthcheck:
 
 ---
 
+### 13. Evals: Code, model graders, and human-in-the-loop are non-negotiable
+
+AI applications don't have deterministic outputs — the same query can return subtly different answers depending on context window changes, model updates, or upstream data drift. Without evals, you have no signal whether things got better or worse after a change.
+
+Three layers are required:
+
+**Code evals** — deterministic, fast, run in CI. Verify retrieval precision, chunk integrity, cache correctness, and injection detection with standard unit tests. These tell you your pipeline is wired correctly.
+
+**Model graders** — use a stronger LLM as a judge to score faithfulness (no hallucinations), relevance, and completeness across a golden eval set. Run them after every deployment. They catch quality regressions that unit tests can't see.
+
+**Human-in-the-loop (HITL)** — wire real user feedback (thumbs up/down, free-text corrections) directly into LangSmith or your eval store. This is the only ground truth you actually trust long-term. Every thumbs-down is a labelled failure case; collect enough and you have a regression suite built from production traffic.
+
+Running only one or two of these layers will leave a blind spot. A passing unit suite won't catch a model that answers correctly but cites the wrong paper. A perfect model-grader score won't catch a systematic bug in your chunker that only users notice.
+
+#### Code eval — retrieval precision
+
+```python
+# eval/test_retrieval.py
+import pytest
+from backend.app.retriever import Retriever
+
+# Ground truth: manually annotated {query -> list[expected_chunk_ids]}
+GROUND_TRUTH = {
+    "how does attention work in transformers?": ["attention-paper-chunk-4", "attention-paper-chunk-7"],
+    "what is RLHF?": ["rlhf-paper-chunk-2", "rlhf-paper-chunk-5", "rlhf-paper-chunk-9"],
+}
+
+def precision_at_k(expected_ids: list[str], retrieved: list[dict]) -> float:
+    retrieved_ids = {c["chunk_id"] for c in retrieved}
+    hits = set(expected_ids) & retrieved_ids
+    return len(hits) / len(expected_ids)
+
+@pytest.fixture(scope="session")
+def retriever():
+    return Retriever()
+
+@pytest.mark.parametrize("query,expected_ids,min_precision", [
+    ("how does attention work in transformers?", GROUND_TRUTH["how does attention work in transformers?"], 0.6),
+    ("what is RLHF?", GROUND_TRUTH["what is RLHF?"], 0.8),
+])
+def test_retrieval_precision(retriever, query, expected_ids, min_precision):
+    results = retriever.search(query, k=5)
+    p = precision_at_k(expected_ids, results)
+    assert p >= min_precision, f"Precision {p:.2f} below threshold {min_precision} for: {query}"
+
+def test_metadata_completeness(retriever):
+    """Every chunk must carry the fields the UI depends on."""
+    results = retriever.search("transformers", k=3)
+    required = {"chunk_id", "paper_title", "section_title", "page_number", "source"}
+    for chunk in results:
+        missing = required - chunk.keys()
+        assert not missing, f"Chunk missing fields: {missing}"
+```
+
+#### Model grader eval — LLM as judge
+
+```python
+# eval/model_grader.py
+import json
+import anthropic
+
+client = anthropic.Anthropic()
+
+JUDGE_PROMPT = """You are evaluating the output of a RAG system.
+
+Question: {question}
+Retrieved context: {context}
+System answer: {answer}
+
+Score each dimension 1–5:
+- faithfulness: Is every claim in the answer supported by the context? (5 = fully grounded, no hallucinations)
+- relevance: Does the answer address what was asked? (5 = directly answers the question)
+- completeness: Does it cover the key points available in the context? (5 = thorough)
+
+Return only valid JSON: {{"faithfulness": N, "relevance": N, "completeness": N, "explanation": "one sentence"}}"""
+
+def grade(question: str, context: str, answer: str) -> dict:
+    response = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=300,
+        messages=[{
+            "role": "user",
+            "content": JUDGE_PROMPT.format(question=question, context=context, answer=answer)
+        }]
+    )
+    return json.loads(response.content[0].text)
+
+def run_eval_suite(eval_set: list[dict], passing_threshold: float = 4.0) -> dict:
+    """
+    eval_set: list of {"question": str, "context": str, "answer": str}
+    Returns summary with per-question scores and overall pass/fail.
+    """
+    results = []
+    for item in eval_set:
+        scores = grade(item["question"], item["context"], item["answer"])
+        avg = sum([scores["faithfulness"], scores["relevance"], scores["completeness"]]) / 3
+        results.append({**item, **scores, "avg_score": avg, "passed": avg >= passing_threshold})
+
+    passed = sum(1 for r in results if r["passed"])
+    return {
+        "total": len(results),
+        "passed": passed,
+        "pass_rate": passed / len(results),
+        "results": results,
+    }
+
+# Usage:
+# suite = [
+#     {"question": "How does attention work?", "context": "<retrieved chunks>", "answer": "<rag answer>"},
+# ]
+# report = run_eval_suite(suite)
+# assert report["pass_rate"] >= 0.85, f"Eval suite failed: {report['pass_rate']:.0%} pass rate"
+```
+
+#### Human-in-the-loop eval — wiring feedback to LangSmith
+
+```python
+# backend/app/hitl_eval.py
+from langsmith import Client
+
+langsmith_client = Client()
+
+def record_user_feedback(run_id: str, thumbs_up: bool, comment: str = "") -> None:
+    """Called from the /api/feedback endpoint — links UI feedback to the exact RAG trace."""
+    langsmith_client.create_feedback(
+        run_id=run_id,
+        key="user_satisfaction",
+        score=1 if thumbs_up else 0,
+        comment=comment,
+        feedback_source_type="app",
+    )
+
+def export_negative_feedback_as_eval_set(limit: int = 100) -> list[dict]:
+    """
+    Pull thumbs-down runs from LangSmith and turn them into a labelled eval set.
+    Run this periodically to grow your golden regression suite from real failures.
+    """
+    feedback_list = langsmith_client.list_feedback(
+        feedback_key=["user_satisfaction"],
+        limit=limit,
+    )
+
+    eval_cases = []
+    for fb in feedback_list:
+        if fb.score == 0:  # thumbs down only
+            run = langsmith_client.read_run(fb.run_id)
+            eval_cases.append({
+                "run_id": str(fb.run_id),
+                "question": run.inputs.get("query", ""),
+                "answer": run.outputs.get("response", "") if run.outputs else "",
+                "user_comment": fb.comment or "",
+            })
+
+    return eval_cases
+
+# Suggested CI workflow:
+# 1. On each PR, run test_retrieval.py (code evals) — must pass to merge.
+# 2. After deploy to staging, run run_eval_suite() against your golden set — alert if pass_rate drops.
+# 3. Weekly: export_negative_feedback_as_eval_set() → review → promote good cases to the golden set.
+```
+
+**File**: `eval/test_retrieval.py`, `eval/model_grader.py`, `backend/app/hitl_eval.py`
+
+---
+
 # Sample Project 
 
 # arXiv RAG
