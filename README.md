@@ -1,3 +1,484 @@
+The main purpose of this Repo is to get an understanding of lessons learnt during the development of a production-ready RAG application.
+
+---
+
+## Production Lessons
+
+This codebase was designed around 14 specific lessons learned from shipping a production RAG system. Each decision is traceable to a real problem:
+
+### 1. Build the project around retrieval accuracy — search algorithm and query transformation are the two biggest levers
+
+Every other improvement — faster inference, richer UI, better generation prompts — is capped by what gets retrieved. If the wrong chunks come back, no amount of downstream polish recovers the answer. Retrieval accuracy should be treated as the primary engineering objective from day one, measured continuously against a real eval set.
+
+Two categories of decisions determine retrieval accuracy:
+
+**Index-time decisions** (fixed once the index is built — changing them requires a full reindex):
+- **Embedding model** — sets the semantic quality ceiling. A weaker model cannot be compensated for downstream.
+- **Chunking strategy** — determines how much context each retrievable unit carries and where boundaries fall.
+
+**Query-time decisions** (tunable without touching the index — these are where active iteration happens):
+- **Search algorithm** — pure dense vector similarity is the baseline, not the best option. Hybrid search (dense + BM25 sparse) consistently outperforms pure dense retrieval on technical text, because BM25 catches exact matches that cosine similarity under-weights: acronyms, author names, paper titles, and rare terminology. Adding a re-ranking pass on top of the initial candidate set improves precision further.
+- **Query transformation** — the vocabulary gap between how users ask questions and how papers are written is the silent cause of most retrieval misses. A query like *"how do models learn from feedback?"* may not retrieve chunks that use *"reinforcement learning from human preferences"*. Query transformation bridges this gap before the query reaches the vector database. This is distinct from prompt optimisation for response generation: transforming the query improves what is *retrieved*; tuning the generation prompt improves how the retrieved content is *expressed*. Both matter, but they are separate problems with separate solutions.
+
+Retrieval accuracy is the product of four compounding decisions:
+
+| Layer | Set when | Lever |
+|---|---|---|
+| Embedding model | Index time (fixed after) | Semantic quality ceiling — cannot be recovered downstream |
+| Chunking strategy | Index time | Context preserved per chunk vs. retrieval noise |
+| Search algorithm | Query time | Dense-only vs. hybrid vs. re-ranking |
+| Query transformation | Query time | Vocabulary gap between user language and document language |
+
+The bottom two are what you tune during development without rebuilding the index.
+
+#### Search algorithm: hybrid retrieval with Reciprocal Rank Fusion
+
+Pure dense search misses exact-match cases (acronyms, paper titles, author names). BM25 misses semantic cases. Hybrid search with RRF merges both ranked lists without requiring normalised scores.
+
+```python
+# backend/app/hybrid_retriever.py
+from rank_bm25 import BM25Okapi
+
+def reciprocal_rank_fusion(ranked_lists: list, k: int = 60) -> list:
+    """Merge multiple ranked result lists into one using RRF scoring."""
+    scores = {}
+    for ranked in ranked_lists:
+        for rank, item in enumerate(ranked):
+            cid = item["metadata"]["chunk_id"]
+            scores[cid] = scores.get(cid, 0) + 1.0 / (k + rank + 1)
+            scores[cid + "__item"] = item  # store for lookup
+    return sorted(
+        [scores[k + "__item"] for k in scores if not k.endswith("__item")],
+        key=lambda x: scores[x["metadata"]["chunk_id"]],
+        reverse=True,
+    )
+
+class HybridRetriever:
+    """
+    Combines Pinecone dense search with BM25 sparse search.
+    Merge strategy: Reciprocal Rank Fusion (no score normalisation needed).
+    """
+
+    def __init__(self, dense_retriever, corpus_chunks: list):
+        self.dense = dense_retriever
+        tokenized = [chunk["content"].lower().split() for chunk in corpus_chunks]
+        self.bm25 = BM25Okapi(tokenized)
+        self.chunks = corpus_chunks
+
+    def search(self, query: str, k: int = 5, fetch_k: int = 20) -> list:
+        # Dense retrieval — fetch more than k, re-rank will narrow it
+        dense_results = self.dense.query_documents(query, k=fetch_k)
+
+        # Sparse retrieval via BM25
+        tokens = query.lower().split()
+        bm25_scores = self.bm25.get_scores(tokens)
+        sparse_ranked = [
+            self.chunks[i]
+            for i in sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:fetch_k]
+        ]
+
+        # Merge with RRF and return top-k
+        merged = reciprocal_rank_fusion([dense_results, sparse_ranked])
+        return merged[:k]
+```
+
+#### Search algorithm: cross-encoder re-ranking
+
+After retrieving a broad candidate set, a cross-encoder scores each (query, chunk) pair jointly — far more accurate than a bi-encoder similarity score, at the cost of latency. Run it on the top-20 candidates, return the top-5.
+
+```python
+# backend/app/reranker.py
+from sentence_transformers import CrossEncoder
+
+_model = None
+
+def get_reranker() -> CrossEncoder:
+    global _model
+    if _model is None:
+        # Lightweight model — ~80MB, ~50ms for 20 pairs on CPU
+        _model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return _model
+
+def rerank(query: str, chunks: list, top_n: int = 5) -> list:
+    """
+    Re-rank retrieval candidates using a cross-encoder.
+    chunks: output from dense or hybrid retrieval (fetch 3-4x top_n candidates)
+    """
+    reranker = get_reranker()
+    pairs = [(query, chunk["content"]) for chunk in chunks]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
+    return [chunk for _, chunk in ranked[:top_n]]
+```
+
+#### Query transformation: multi-query retrieval with RRF
+
+A single query phrasing often misses relevant chunks that would match under a different phrasing. Generate N variants, retrieve independently, merge with RRF.
+
+```python
+# backend/app/query_transform.py
+import anthropic
+
+client = anthropic.Anthropic()
+
+def generate_query_variants(query: str, n: int = 3) -> list:
+    """Generate N semantically equivalent phrasings of the query."""
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Generate {n} different ways to phrase this question for searching "
+                f"academic papers. Return only the questions, one per line, no numbering.\n\n"
+                f"Question: {query}"
+            ),
+        }],
+    )
+    lines = response.content[0].text.strip().splitlines()
+    return [query] + [l.strip() for l in lines if l.strip()][:n]
+
+def multi_query_retrieve(query: str, retriever, k: int = 5, n_variants: int = 3) -> list:
+    """
+    Retrieve using N query variants, merge with RRF.
+    Bridges the vocabulary gap between user language and document language.
+    """
+    from backend.app.hybrid_retriever import reciprocal_rank_fusion
+
+    variants = generate_query_variants(query, n=n_variants)
+    ranked_lists = [retriever.query_documents(v, k=k * 2) for v in variants]
+    merged = reciprocal_rank_fusion(ranked_lists)
+    return merged[:k]
+
+def hyde_retrieve(query: str, retriever, k: int = 5) -> list:
+    """
+    HyDE: embed a *hypothetical answer* instead of the raw question.
+    Often a much better retrieval signal — the hypothetical answer lives in
+    the same semantic space as real paper excerpts, the raw question does not.
+    """
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=150,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Write a short excerpt from an academic paper that would answer this question. "
+                f"Write it in a technical, paper-like style.\n\nQuestion: {query}"
+            ),
+        }],
+    )
+    hypothetical_answer = response.content[0].text.strip()
+    # Retrieve using the hypothetical answer as the query
+    return retriever.query_documents(hypothetical_answer, k=k)
+```
+
+**Practical recommendation for this codebase:** The highest-ROI change is adding hybrid search (BM25 + dense with RRF) because academic papers are dense with exact terminology that pure cosine similarity under-weights. Add re-ranking second. Multi-query and HyDE are diminishing returns after those two are in place — measure with `eval/test_retrieval.py` before adding complexity.
+
+**File**: `backend/app/hybrid_retriever.py`, `backend/app/reranker.py`, `backend/app/query_transform.py`
+
+---
+
+### 2. Lock your embedding model on day one
+
+`text-embedding-3-small` (1536 dims) is hardcoded in `embeddings.py` and never changes, regardless of which chat provider you configure. Switching embedding models requires rebuilding the entire index. The chat layer (Gemini ↔ Azure OpenAI) can be swapped freely via `CLIENT_TO_BE_USED` because it doesn't affect the vector space.
+
+**File**: `backend/app/embeddings.py`, `backend/app/ai_client_factory.py`
+
+---
+
+### 3. Chunk size is domain-specific — test it on your corpus
+
+Final configuration: `chunk_size=800, chunk_overlap=150` (18.75% overlap).
+
+For dense academic papers, smaller chunks lose the explanatory context that gives them meaning. Larger chunks risk exceeding the context window when retrieving k=5. The 18.75% overlap ensures sentences at chunk boundaries appear in adjacent chunks.
+
+**Recommendation**: test retrieval quality on 20-30 real queries over your domain before committing to a chunk size.
+
+**File**: `backend/app/retriever.py` → `index_documents()`
+
+---
+
+### 4. Enrich metadata at index time, exhaustively
+
+Every chunk stored in Pinecone carries: `paper_title`, `section_title`, `page_number`, `source`, `chunk_id`, `language`. This metadata is extracted once at index time (`chunking.py`) and returned with every search result — no secondary lookups needed.
+
+The UI displays "Attention Is All You Need | Section: Results | p. 8" directly from Pinecone metadata.
+
+**File**: `backend/app/chunking.py` → `_build_chunks()`
+
+---
+
+### 5. Change detection prevents redundant re-indexing
+
+Before processing any PDF, the indexer compares modification timestamps against a stored manifest (`.pinecone_metadata/index_metadata.json`). Unchanged files are skipped. Only new or modified PDFs are re-embedded and upserted.
+
+Without this, every restart with `AUTO_INDEX_ON_STARTUP=true` re-indexes the full corpus, burning embedding API credits.
+
+**File**: `backend/app/retriever.py` → `_should_skip_indexing()`
+
+---
+
+### 6. Query improvement and response generation need different LLM budgets
+
+Two different pipeline stages, two different configurations:
+
+- **Query improvement** (`thinking_budget=1024`): "ViT" → "Vision Transformer image classification self-attention patch embeddings" — needs reasoning to expand acronyms and map user intent to paper terminology
+- **Response generation** (`thinking_budget=0`): context is already retrieved; just format and cite it — reasoning adds latency and cost with no quality gain
+
+**File**: `backend/app/gemini_client.py` → `improve_query()`, `generate_chat_response()`
+
+---
+
+### 7. Cache retrieved context, not generated responses
+
+The expensive steps are vector search + query improvement (LLM API call). The response generation is fast and needs fresh conversation context anyway.
+
+Cache key: `MD5(query) + session_id` → stored in SQLite. On cache hit, Pinecone and the query improver are bypassed entirely. Response generation still runs (incorporating fresh conversation history).
+
+**File**: `backend/app/enhanced_retriever.py`, `backend/app/sqlite_database.py`
+
+---
+
+### 8. Cap conversation history at 3-5 turns
+
+Full conversation history bloats the prompt and pushes retrieved context down — or out. Three turns is sufficient for follow-up questions ("tell me more", "what about the results section?").
+
+```python
+for msg in conversation_history[-3:]:  # Hard cap
+```
+
+**File**: `backend/app/gemini_client.py` → `improve_query()`
+
+---
+
+### 9. Prompt injection is a RAG-specific attack surface
+
+A RAG pipeline has multiple LLM calls: query improver → response generator. A malicious query can propagate through the chain. Two defenses:
+
+1. **Pattern matching** (30+ patterns): "ignore previous instructions", "DAN", "jailbreak", etc. — checked before any LLM call
+2. **Boundary markers**: every piece of user-controlled content is wrapped in `[USER_QUERY_START]...[USER_QUERY_END]` so the model treats it as data, not instructions
+
+**File**: `backend/app/prompt_utils.py`, called from both AI clients
+
+---
+
+### 10. Async is not optional for RAG backends
+
+Every search request makes 3+ external API calls (Pinecone + query improver + response generator). In a synchronous framework (Flask), each concurrent request blocks a thread for the full duration of all I/O. Under load, the thread pool exhausts quickly.
+
+FastAPI with `async/await` throughout means the server handles concurrent requests without proportionally growing thread count.
+
+**File**: `backend/server.py`
+
+---
+
+### 11. Exponential backoff on every external API call
+
+AI APIs have transient failures. The search function is wrapped with a decorator that retries up to 3 times with delays of 1s → 2s → 4s. The client-side timeout (60s) accommodates this.
+
+Generic decorator works on both sync and async functions.
+
+**File**: `backend/app/retry_util.py`, applied in `backend/server.py`
+
+---
+
+### 12. Separate "container running" from "container ready"
+
+The `/api/health` endpoint checks that all service instances (retriever, enhanced retriever, conversation DB) finished initializing — not just that the process started. The Docker healthcheck polls this endpoint with a `start_period: 40s` grace period.
+
+```yaml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+  start_period: 40s  # Gives services time to initialize
+```
+
+**File**: `docker-compose.yml`, `backend/server.py` → `health_check()`
+
+---
+
+### 13. Use RAG-native observability tooling
+
+LangSmith was chosen over MLflow specifically because it understands retrieval pipelines. Each stage is a named trace:
+
+```python
+@traceable(name="pinecone_vector_search")
+@traceable(name="gemini_improve_query")
+@traceable(name="enhanced_retriever_query")
+```
+
+User feedback (thumbs up/down) is linked to specific run IDs via `langsmith_client.create_feedback()`, so you can trace a bad response back to exactly which retrieval step failed.
+
+**File**: `backend/app/retriever.py`, `backend/app/gemini_client.py`, `backend/server.py`
+
+---
+
+### 14. Evals: Code, model graders, and human-in-the-loop are non-negotiable
+
+AI applications don't have deterministic outputs — the same query can return subtly different answers depending on context window changes, model updates, or upstream data drift. Without evals, you have no signal whether things got better or worse after a change.
+
+Three layers are required:
+
+**Code evals** — deterministic, fast, run in CI. Verify retrieval precision, chunk integrity, cache correctness, and injection detection with standard unit tests. These tell you your pipeline is wired correctly.
+
+**Model graders** — use a stronger LLM as a judge to score faithfulness (no hallucinations), relevance, and completeness across a golden eval set. Run them after every deployment. They catch quality regressions that unit tests can't see.
+
+**Human-in-the-loop (HITL)** — wire real user feedback (thumbs up/down, free-text corrections) directly into LangSmith or your eval store. This is the only ground truth you actually trust long-term. Every thumbs-down is a labelled failure case; collect enough and you have a regression suite built from production traffic.
+
+Running only one or two of these layers will leave a blind spot. A passing unit suite won't catch a model that answers correctly but cites the wrong paper. A perfect model-grader score won't catch a systematic bug in your chunker that only users notice.
+
+#### Code eval — retrieval precision
+
+```python
+# eval/test_retrieval.py
+import pytest
+from backend.app.retriever import Retriever
+
+# Ground truth: manually annotated {query -> list[expected_chunk_ids]}
+GROUND_TRUTH = {
+    "how does attention work in transformers?": ["attention-paper-chunk-4", "attention-paper-chunk-7"],
+    "what is RLHF?": ["rlhf-paper-chunk-2", "rlhf-paper-chunk-5", "rlhf-paper-chunk-9"],
+}
+
+def precision_at_k(expected_ids: list[str], retrieved: list[dict]) -> float:
+    retrieved_ids = {c["chunk_id"] for c in retrieved}
+    hits = set(expected_ids) & retrieved_ids
+    return len(hits) / len(expected_ids)
+
+@pytest.fixture(scope="session")
+def retriever():
+    return Retriever()
+
+@pytest.mark.parametrize("query,expected_ids,min_precision", [
+    ("how does attention work in transformers?", GROUND_TRUTH["how does attention work in transformers?"], 0.6),
+    ("what is RLHF?", GROUND_TRUTH["what is RLHF?"], 0.8),
+])
+def test_retrieval_precision(retriever, query, expected_ids, min_precision):
+    results = retriever.search(query, k=5)
+    p = precision_at_k(expected_ids, results)
+    assert p >= min_precision, f"Precision {p:.2f} below threshold {min_precision} for: {query}"
+
+def test_metadata_completeness(retriever):
+    """Every chunk must carry the fields the UI depends on."""
+    results = retriever.search("transformers", k=3)
+    required = {"chunk_id", "paper_title", "section_title", "page_number", "source"}
+    for chunk in results:
+        missing = required - chunk.keys()
+        assert not missing, f"Chunk missing fields: {missing}"
+```
+
+#### Model grader eval — LLM as judge
+
+```python
+# eval/model_grader.py
+import json
+import anthropic
+
+client = anthropic.Anthropic()
+
+JUDGE_PROMPT = """You are evaluating the output of a RAG system.
+
+Question: {question}
+Retrieved context: {context}
+System answer: {answer}
+
+Score each dimension 1–5:
+- faithfulness: Is every claim in the answer supported by the context? (5 = fully grounded, no hallucinations)
+- relevance: Does the answer address what was asked? (5 = directly answers the question)
+- completeness: Does it cover the key points available in the context? (5 = thorough)
+
+Return only valid JSON: {{"faithfulness": N, "relevance": N, "completeness": N, "explanation": "one sentence"}}"""
+
+def grade(question: str, context: str, answer: str) -> dict:
+    response = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=300,
+        messages=[{
+            "role": "user",
+            "content": JUDGE_PROMPT.format(question=question, context=context, answer=answer)
+        }]
+    )
+    return json.loads(response.content[0].text)
+
+def run_eval_suite(eval_set: list[dict], passing_threshold: float = 4.0) -> dict:
+    """
+    eval_set: list of {"question": str, "context": str, "answer": str}
+    Returns summary with per-question scores and overall pass/fail.
+    """
+    results = []
+    for item in eval_set:
+        scores = grade(item["question"], item["context"], item["answer"])
+        avg = sum([scores["faithfulness"], scores["relevance"], scores["completeness"]]) / 3
+        results.append({**item, **scores, "avg_score": avg, "passed": avg >= passing_threshold})
+
+    passed = sum(1 for r in results if r["passed"])
+    return {
+        "total": len(results),
+        "passed": passed,
+        "pass_rate": passed / len(results),
+        "results": results,
+    }
+
+# Usage:
+# suite = [
+#     {"question": "How does attention work?", "context": "<retrieved chunks>", "answer": "<rag answer>"},
+# ]
+# report = run_eval_suite(suite)
+# assert report["pass_rate"] >= 0.85, f"Eval suite failed: {report['pass_rate']:.0%} pass rate"
+```
+
+#### Human-in-the-loop eval — wiring feedback to LangSmith
+
+```python
+# backend/app/hitl_eval.py
+from langsmith import Client
+
+langsmith_client = Client()
+
+def record_user_feedback(run_id: str, thumbs_up: bool, comment: str = "") -> None:
+    """Called from the /api/feedback endpoint — links UI feedback to the exact RAG trace."""
+    langsmith_client.create_feedback(
+        run_id=run_id,
+        key="user_satisfaction",
+        score=1 if thumbs_up else 0,
+        comment=comment,
+        feedback_source_type="app",
+    )
+
+def export_negative_feedback_as_eval_set(limit: int = 100) -> list[dict]:
+    """
+    Pull thumbs-down runs from LangSmith and turn them into a labelled eval set.
+    Run this periodically to grow your golden regression suite from real failures.
+    """
+    feedback_list = langsmith_client.list_feedback(
+        feedback_key=["user_satisfaction"],
+        limit=limit,
+    )
+
+    eval_cases = []
+    for fb in feedback_list:
+        if fb.score == 0:  # thumbs down only
+            run = langsmith_client.read_run(fb.run_id)
+            eval_cases.append({
+                "run_id": str(fb.run_id),
+                "question": run.inputs.get("query", ""),
+                "answer": run.outputs.get("response", "") if run.outputs else "",
+                "user_comment": fb.comment or "",
+            })
+
+    return eval_cases
+
+# Suggested CI workflow:
+# 1. On each PR, run test_retrieval.py (code evals) — must pass to merge.
+# 2. After deploy to staging, run run_eval_suite() against your golden set — alert if pass_rate drops.
+# 3. Weekly: export_negative_feedback_as_eval_set() → review → promote good cases to the golden set.
+```
+
+**File**: `eval/test_retrieval.py`, `eval/model_grader.py`, `backend/app/hitl_eval.py`
+
+---
+
+# Sample Project 
+
 # arXiv RAG
 
 Production-ready Retrieval Augmented Generation (RAG) system for semantic search over AI/ML research papers.
@@ -175,146 +656,6 @@ Search request body:
    ```
 3. No restart required — new vectors are available immediately
 
----
-
-## Production Lessons
-
-This codebase was designed around 12 specific lessons learned from shipping a production RAG system. Each decision is traceable to a real problem:
-
-### 1. Lock your embedding model on day one
-
-`text-embedding-3-small` (1536 dims) is hardcoded in `embeddings.py` and never changes, regardless of which chat provider you configure. Switching embedding models requires rebuilding the entire index. The chat layer (Gemini ↔ Azure OpenAI) can be swapped freely via `CLIENT_TO_BE_USED` because it doesn't affect the vector space.
-
-**File**: `backend/app/embeddings.py`, `backend/app/ai_client_factory.py`
-
----
-
-### 2. Change detection prevents redundant re-indexing
-
-Before processing any PDF, the indexer compares modification timestamps against a stored manifest (`.pinecone_metadata/index_metadata.json`). Unchanged files are skipped. Only new or modified PDFs are re-embedded and upserted.
-
-Without this: every restart with `AUTO_INDEX_ON_STARTUP=true` re-indexes the full corpus, burning embedding API credits.
-
-**File**: `backend/app/retriever.py` → `_should_skip_indexing()`
-
----
-
-### 3. Query improvement and response generation need different LLM budgets
-
-Two different pipeline stages, two different configurations:
-
-- **Query improvement** (`thinking_budget=1024`): "ViT" → "Vision Transformer image classification self-attention patch embeddings" — needs reasoning to expand acronyms and map user intent to paper terminology
-- **Response generation** (`thinking_budget=0`): context is already retrieved; just format and cite it — reasoning adds latency and cost with no quality gain
-
-**File**: `backend/app/gemini_client.py` → `improve_query()`, `generate_chat_response()`
-
----
-
-### 4. Cache retrieved context, not generated responses
-
-The expensive steps are vector search + query improvement (LLM API call). The response generation is fast and needs fresh conversation context anyway.
-
-Cache key: `MD5(query) + session_id` → stored in SQLite. On cache hit, Pinecone and the query improver are bypassed entirely. Response generation still runs (incorporating fresh conversation history).
-
-**File**: `backend/app/enhanced_retriever.py`, `backend/app/sqlite_database.py`
-
----
-
-### 5. Enrich metadata at index time, exhaustively
-
-Every chunk stored in Pinecone carries: `paper_title`, `section_title`, `page_number`, `source`, `chunk_id`, `language`. This metadata is extracted once at index time (`chunking.py`) and returned with every search result — no secondary lookups needed.
-
-The UI displays "Attention Is All You Need | Section: Results | p. 8" directly from Pinecone metadata.
-
-**File**: `backend/app/chunking.py` → `_build_chunks()`
-
----
-
-### 6. Prompt injection is a RAG-specific attack surface
-
-A RAG pipeline has multiple LLM calls: query improver → response generator. A malicious query can propagate through the chain. Two defenses:
-
-1. **Pattern matching** (30+ patterns): "ignore previous instructions", "DAN", "jailbreak", etc. — checked before any LLM call
-2. **Boundary markers**: every piece of user-controlled content is wrapped in `[USER_QUERY_START]...[USER_QUERY_END]` so the model treats it as data, not instructions
-
-**File**: `backend/app/prompt_utils.py`, called from both AI clients
-
----
-
-### 7. Async is not optional for RAG backends
-
-Every search request makes 3+ external API calls (Pinecone + query improver + response generator). In a synchronous framework (Flask), each concurrent request blocks a thread for the full duration of all I/O. Under load, the thread pool exhausts quickly.
-
-FastAPI with `async/await` throughout means the server handles concurrent requests without proportionally growing thread count.
-
-**File**: `backend/server.py`
-
----
-
-### 8. Exponential backoff on every external API call
-
-AI APIs have transient failures. The search function is wrapped with a decorator that retries up to 3 times with delays of 1s → 2s → 4s. The client-side timeout (60s) accommodates this.
-
-Generic decorator works on both sync and async functions.
-
-**File**: `backend/app/retry_util.py`, applied in `backend/server.py`
-
----
-
-### 9. Chunk size is domain-specific — test it on your corpus
-
-Final configuration: `chunk_size=800, chunk_overlap=150` (18.75% overlap).
-
-For dense academic papers, smaller chunks lose the explanatory context that gives them meaning. Larger chunks risk exceeding the context window when retrieving k=5. The 18.75% overlap ensures sentences at chunk boundaries appear in adjacent chunks.
-
-**Recommendation**: test retrieval quality on 20-30 real queries over your domain before committing to a chunk size.
-
-**File**: `backend/app/retriever.py` → `index_documents()`
-
----
-
-### 10. Cap conversation history at 3-5 turns
-
-Full conversation history bloats the prompt and pushes retrieved context down — or out. Three turns is sufficient for follow-up questions ("tell me more", "what about the results section?").
-
-```python
-for msg in conversation_history[-3:]:  # Hard cap
-```
-
-**File**: `backend/app/gemini_client.py` → `improve_query()`
-
----
-
-### 11. Use RAG-native observability tooling
-
-LangSmith was chosen over MLflow specifically because it understands retrieval pipelines. Each stage is a named trace:
-
-```python
-@traceable(name="pinecone_vector_search")
-@traceable(name="gemini_improve_query")
-@traceable(name="enhanced_retriever_query")
-```
-
-User feedback (thumbs up/down) is linked to specific run IDs via `langsmith_client.create_feedback()`, so you can trace a bad response back to exactly which retrieval step failed.
-
-**File**: `backend/app/retriever.py`, `backend/app/gemini_client.py`, `backend/server.py`
-
----
-
-### 12. Separate "container running" from "container ready"
-
-The `/api/health` endpoint checks that all service instances (retriever, enhanced retriever, conversation DB) finished initializing — not just that the process started. The Docker healthcheck polls this endpoint with a `start_period: 40s` grace period.
-
-```yaml
-healthcheck:
-  test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
-  start_period: 40s  # Gives services time to initialize
-```
-
-**File**: `docker-compose.yml`, `backend/server.py` → `health_check()`
-
----
-
 ## Project Structure
 
 ```
@@ -348,11 +689,3 @@ arxiv-rag/
 ```
 
 ---
-
-## License
-
-MIT — use freely, attribution appreciated.
-
----
-
-*Built to demonstrate production RAG engineering patterns. See the [blog post](docs/production-rag-lessons.md) for the full write-up of lessons learned.*
