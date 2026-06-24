@@ -4,9 +4,181 @@ The main purpose of this Repo is to get an understanding of lessons learnt durin
 
 ## Production Lessons
 
-This codebase was designed around 12 specific lessons learned from shipping a production RAG system. Each decision is traceable to a real problem:
+This codebase was designed around 14 specific lessons learned from shipping a production RAG system. Each decision is traceable to a real problem:
 
-### 1. Lock your embedding model on day one
+### 1. Build the project around retrieval accuracy — search algorithm and query transformation are the two biggest levers
+
+Every other improvement — faster inference, richer UI, better generation prompts — is capped by what gets retrieved. If the wrong chunks come back, no amount of downstream polish recovers the answer. Retrieval accuracy should be treated as the primary engineering objective from day one, measured continuously against a real eval set.
+
+Two categories of decisions determine retrieval accuracy:
+
+**Index-time decisions** (fixed once the index is built — changing them requires a full reindex):
+- **Embedding model** — sets the semantic quality ceiling. A weaker model cannot be compensated for downstream.
+- **Chunking strategy** — determines how much context each retrievable unit carries and where boundaries fall.
+
+**Query-time decisions** (tunable without touching the index — these are where active iteration happens):
+- **Search algorithm** — pure dense vector similarity is the baseline, not the best option. Hybrid search (dense + BM25 sparse) consistently outperforms pure dense retrieval on technical text, because BM25 catches exact matches that cosine similarity under-weights: acronyms, author names, paper titles, and rare terminology. Adding a re-ranking pass on top of the initial candidate set improves precision further.
+- **Query transformation** — the vocabulary gap between how users ask questions and how papers are written is the silent cause of most retrieval misses. A query like *"how do models learn from feedback?"* may not retrieve chunks that use *"reinforcement learning from human preferences"*. Query transformation bridges this gap before the query reaches the vector database. This is distinct from prompt optimisation for response generation: transforming the query improves what is *retrieved*; tuning the generation prompt improves how the retrieved content is *expressed*. Both matter, but they are separate problems with separate solutions.
+
+Retrieval accuracy is the product of four compounding decisions:
+
+| Layer | Set when | Lever |
+|---|---|---|
+| Embedding model | Index time (fixed after) | Semantic quality ceiling — cannot be recovered downstream |
+| Chunking strategy | Index time | Context preserved per chunk vs. retrieval noise |
+| Search algorithm | Query time | Dense-only vs. hybrid vs. re-ranking |
+| Query transformation | Query time | Vocabulary gap between user language and document language |
+
+The bottom two are what you tune during development without rebuilding the index.
+
+#### Search algorithm: hybrid retrieval with Reciprocal Rank Fusion
+
+Pure dense search misses exact-match cases (acronyms, paper titles, author names). BM25 misses semantic cases. Hybrid search with RRF merges both ranked lists without requiring normalised scores.
+
+```python
+# backend/app/hybrid_retriever.py
+from rank_bm25 import BM25Okapi
+
+def reciprocal_rank_fusion(ranked_lists: list, k: int = 60) -> list:
+    """Merge multiple ranked result lists into one using RRF scoring."""
+    scores = {}
+    for ranked in ranked_lists:
+        for rank, item in enumerate(ranked):
+            cid = item["metadata"]["chunk_id"]
+            scores[cid] = scores.get(cid, 0) + 1.0 / (k + rank + 1)
+            scores[cid + "__item"] = item  # store for lookup
+    return sorted(
+        [scores[k + "__item"] for k in scores if not k.endswith("__item")],
+        key=lambda x: scores[x["metadata"]["chunk_id"]],
+        reverse=True,
+    )
+
+class HybridRetriever:
+    """
+    Combines Pinecone dense search with BM25 sparse search.
+    Merge strategy: Reciprocal Rank Fusion (no score normalisation needed).
+    """
+
+    def __init__(self, dense_retriever, corpus_chunks: list):
+        self.dense = dense_retriever
+        tokenized = [chunk["content"].lower().split() for chunk in corpus_chunks]
+        self.bm25 = BM25Okapi(tokenized)
+        self.chunks = corpus_chunks
+
+    def search(self, query: str, k: int = 5, fetch_k: int = 20) -> list:
+        # Dense retrieval — fetch more than k, re-rank will narrow it
+        dense_results = self.dense.query_documents(query, k=fetch_k)
+
+        # Sparse retrieval via BM25
+        tokens = query.lower().split()
+        bm25_scores = self.bm25.get_scores(tokens)
+        sparse_ranked = [
+            self.chunks[i]
+            for i in sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:fetch_k]
+        ]
+
+        # Merge with RRF and return top-k
+        merged = reciprocal_rank_fusion([dense_results, sparse_ranked])
+        return merged[:k]
+```
+
+#### Search algorithm: cross-encoder re-ranking
+
+After retrieving a broad candidate set, a cross-encoder scores each (query, chunk) pair jointly — far more accurate than a bi-encoder similarity score, at the cost of latency. Run it on the top-20 candidates, return the top-5.
+
+```python
+# backend/app/reranker.py
+from sentence_transformers import CrossEncoder
+
+_model = None
+
+def get_reranker() -> CrossEncoder:
+    global _model
+    if _model is None:
+        # Lightweight model — ~80MB, ~50ms for 20 pairs on CPU
+        _model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return _model
+
+def rerank(query: str, chunks: list, top_n: int = 5) -> list:
+    """
+    Re-rank retrieval candidates using a cross-encoder.
+    chunks: output from dense or hybrid retrieval (fetch 3-4x top_n candidates)
+    """
+    reranker = get_reranker()
+    pairs = [(query, chunk["content"]) for chunk in chunks]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
+    return [chunk for _, chunk in ranked[:top_n]]
+```
+
+#### Query transformation: multi-query retrieval with RRF
+
+A single query phrasing often misses relevant chunks that would match under a different phrasing. Generate N variants, retrieve independently, merge with RRF.
+
+```python
+# backend/app/query_transform.py
+import anthropic
+
+client = anthropic.Anthropic()
+
+def generate_query_variants(query: str, n: int = 3) -> list:
+    """Generate N semantically equivalent phrasings of the query."""
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Generate {n} different ways to phrase this question for searching "
+                f"academic papers. Return only the questions, one per line, no numbering.\n\n"
+                f"Question: {query}"
+            ),
+        }],
+    )
+    lines = response.content[0].text.strip().splitlines()
+    return [query] + [l.strip() for l in lines if l.strip()][:n]
+
+def multi_query_retrieve(query: str, retriever, k: int = 5, n_variants: int = 3) -> list:
+    """
+    Retrieve using N query variants, merge with RRF.
+    Bridges the vocabulary gap between user language and document language.
+    """
+    from backend.app.hybrid_retriever import reciprocal_rank_fusion
+
+    variants = generate_query_variants(query, n=n_variants)
+    ranked_lists = [retriever.query_documents(v, k=k * 2) for v in variants]
+    merged = reciprocal_rank_fusion(ranked_lists)
+    return merged[:k]
+
+def hyde_retrieve(query: str, retriever, k: int = 5) -> list:
+    """
+    HyDE: embed a *hypothetical answer* instead of the raw question.
+    Often a much better retrieval signal — the hypothetical answer lives in
+    the same semantic space as real paper excerpts, the raw question does not.
+    """
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=150,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Write a short excerpt from an academic paper that would answer this question. "
+                f"Write it in a technical, paper-like style.\n\nQuestion: {query}"
+            ),
+        }],
+    )
+    hypothetical_answer = response.content[0].text.strip()
+    # Retrieve using the hypothetical answer as the query
+    return retriever.query_documents(hypothetical_answer, k=k)
+```
+
+**Practical recommendation for this codebase:** The highest-ROI change is adding hybrid search (BM25 + dense with RRF) because academic papers are dense with exact terminology that pure cosine similarity under-weights. Add re-ranking second. Multi-query and HyDE are diminishing returns after those two are in place — measure with `eval/test_retrieval.py` before adding complexity.
+
+**File**: `backend/app/hybrid_retriever.py`, `backend/app/reranker.py`, `backend/app/query_transform.py`
+
+---
+
+### 2. Lock your embedding model on day one
 
 `text-embedding-3-small` (1536 dims) is hardcoded in `embeddings.py` and never changes, regardless of which chat provider you configure. Switching embedding models requires rebuilding the entire index. The chat layer (Gemini ↔ Azure OpenAI) can be swapped freely via `CLIENT_TO_BE_USED` because it doesn't affect the vector space.
 
@@ -14,79 +186,7 @@ This codebase was designed around 12 specific lessons learned from shipping a pr
 
 ---
 
-### 2. Change detection prevents redundant re-indexing
-
-Before processing any PDF, the indexer compares modification timestamps against a stored manifest (`.pinecone_metadata/index_metadata.json`). Unchanged files are skipped. Only new or modified PDFs are re-embedded and upserted.
-
-Without this, every restart with `AUTO_INDEX_ON_STARTUP=true` re-indexes the full corpus, burning embedding API credits.
-
-**File**: `backend/app/retriever.py` → `_should_skip_indexing()`
-
----
-
-### 3. Query improvement and response generation need different LLM budgets
-
-Two different pipeline stages, two different configurations:
-
-- **Query improvement** (`thinking_budget=1024`): "ViT" → "Vision Transformer image classification self-attention patch embeddings" — needs reasoning to expand acronyms and map user intent to paper terminology
-- **Response generation** (`thinking_budget=0`): context is already retrieved; just format and cite it — reasoning adds latency and cost with no quality gain
-
-**File**: `backend/app/gemini_client.py` → `improve_query()`, `generate_chat_response()`
-
----
-
-### 4. Cache retrieved context, not generated responses
-
-The expensive steps are vector search + query improvement (LLM API call). The response generation is fast and needs fresh conversation context anyway.
-
-Cache key: `MD5(query) + session_id` → stored in SQLite. On cache hit, Pinecone and the query improver are bypassed entirely. Response generation still runs (incorporating fresh conversation history).
-
-**File**: `backend/app/enhanced_retriever.py`, `backend/app/sqlite_database.py`
-
----
-
-### 5. Enrich metadata at index time, exhaustively
-
-Every chunk stored in Pinecone carries: `paper_title`, `section_title`, `page_number`, `source`, `chunk_id`, `language`. This metadata is extracted once at index time (`chunking.py`) and returned with every search result — no secondary lookups needed.
-
-The UI displays "Attention Is All You Need | Section: Results | p. 8" directly from Pinecone metadata.
-
-**File**: `backend/app/chunking.py` → `_build_chunks()`
-
----
-
-### 6. Prompt injection is a RAG-specific attack surface
-
-A RAG pipeline has multiple LLM calls: query improver → response generator. A malicious query can propagate through the chain. Two defenses:
-
-1. **Pattern matching** (30+ patterns): "ignore previous instructions", "DAN", "jailbreak", etc. — checked before any LLM call
-2. **Boundary markers**: every piece of user-controlled content is wrapped in `[USER_QUERY_START]...[USER_QUERY_END]` so the model treats it as data, not instructions
-
-**File**: `backend/app/prompt_utils.py`, called from both AI clients
-
----
-
-### 7. Async is not optional for RAG backends
-
-Every search request makes 3+ external API calls (Pinecone + query improver + response generator). In a synchronous framework (Flask), each concurrent request blocks a thread for the full duration of all I/O. Under load, the thread pool exhausts quickly.
-
-FastAPI with `async/await` throughout means the server handles concurrent requests without proportionally growing thread count.
-
-**File**: `backend/server.py`
-
----
-
-### 8. Exponential backoff on every external API call
-
-AI APIs have transient failures. The search function is wrapped with a decorator that retries up to 3 times with delays of 1s → 2s → 4s. The client-side timeout (60s) accommodates this.
-
-Generic decorator works on both sync and async functions.
-
-**File**: `backend/app/retry_util.py`, applied in `backend/server.py`
-
----
-
-### 9. Chunk size is domain-specific — test it on your corpus
+### 3. Chunk size is domain-specific — test it on your corpus
 
 Final configuration: `chunk_size=800, chunk_overlap=150` (18.75% overlap).
 
@@ -98,7 +198,48 @@ For dense academic papers, smaller chunks lose the explanatory context that give
 
 ---
 
-### 10. Cap conversation history at 3-5 turns
+### 4. Enrich metadata at index time, exhaustively
+
+Every chunk stored in Pinecone carries: `paper_title`, `section_title`, `page_number`, `source`, `chunk_id`, `language`. This metadata is extracted once at index time (`chunking.py`) and returned with every search result — no secondary lookups needed.
+
+The UI displays "Attention Is All You Need | Section: Results | p. 8" directly from Pinecone metadata.
+
+**File**: `backend/app/chunking.py` → `_build_chunks()`
+
+---
+
+### 5. Change detection prevents redundant re-indexing
+
+Before processing any PDF, the indexer compares modification timestamps against a stored manifest (`.pinecone_metadata/index_metadata.json`). Unchanged files are skipped. Only new or modified PDFs are re-embedded and upserted.
+
+Without this, every restart with `AUTO_INDEX_ON_STARTUP=true` re-indexes the full corpus, burning embedding API credits.
+
+**File**: `backend/app/retriever.py` → `_should_skip_indexing()`
+
+---
+
+### 6. Query improvement and response generation need different LLM budgets
+
+Two different pipeline stages, two different configurations:
+
+- **Query improvement** (`thinking_budget=1024`): "ViT" → "Vision Transformer image classification self-attention patch embeddings" — needs reasoning to expand acronyms and map user intent to paper terminology
+- **Response generation** (`thinking_budget=0`): context is already retrieved; just format and cite it — reasoning adds latency and cost with no quality gain
+
+**File**: `backend/app/gemini_client.py` → `improve_query()`, `generate_chat_response()`
+
+---
+
+### 7. Cache retrieved context, not generated responses
+
+The expensive steps are vector search + query improvement (LLM API call). The response generation is fast and needs fresh conversation context anyway.
+
+Cache key: `MD5(query) + session_id` → stored in SQLite. On cache hit, Pinecone and the query improver are bypassed entirely. Response generation still runs (incorporating fresh conversation history).
+
+**File**: `backend/app/enhanced_retriever.py`, `backend/app/sqlite_database.py`
+
+---
+
+### 8. Cap conversation history at 3-5 turns
 
 Full conversation history bloats the prompt and pushes retrieved context down — or out. Three turns is sufficient for follow-up questions ("tell me more", "what about the results section?").
 
@@ -110,19 +251,34 @@ for msg in conversation_history[-3:]:  # Hard cap
 
 ---
 
-### 11. Use RAG-native observability tooling
+### 9. Prompt injection is a RAG-specific attack surface
 
-LangSmith was chosen over MLflow specifically because it understands retrieval pipelines. Each stage is a named trace:
+A RAG pipeline has multiple LLM calls: query improver → response generator. A malicious query can propagate through the chain. Two defenses:
 
-```python
-@traceable(name="pinecone_vector_search")
-@traceable(name="gemini_improve_query")
-@traceable(name="enhanced_retriever_query")
-```
+1. **Pattern matching** (30+ patterns): "ignore previous instructions", "DAN", "jailbreak", etc. — checked before any LLM call
+2. **Boundary markers**: every piece of user-controlled content is wrapped in `[USER_QUERY_START]...[USER_QUERY_END]` so the model treats it as data, not instructions
 
-User feedback (thumbs up/down) is linked to specific run IDs via `langsmith_client.create_feedback()`, so you can trace a bad response back to exactly which retrieval step failed.
+**File**: `backend/app/prompt_utils.py`, called from both AI clients
 
-**File**: `backend/app/retriever.py`, `backend/app/gemini_client.py`, `backend/server.py`
+---
+
+### 10. Async is not optional for RAG backends
+
+Every search request makes 3+ external API calls (Pinecone + query improver + response generator). In a synchronous framework (Flask), each concurrent request blocks a thread for the full duration of all I/O. Under load, the thread pool exhausts quickly.
+
+FastAPI with `async/await` throughout means the server handles concurrent requests without proportionally growing thread count.
+
+**File**: `backend/server.py`
+
+---
+
+### 11. Exponential backoff on every external API call
+
+AI APIs have transient failures. The search function is wrapped with a decorator that retries up to 3 times with delays of 1s → 2s → 4s. The client-side timeout (60s) accommodates this.
+
+Generic decorator works on both sync and async functions.
+
+**File**: `backend/app/retry_util.py`, applied in `backend/server.py`
 
 ---
 
@@ -140,7 +296,23 @@ healthcheck:
 
 ---
 
-### 13. Evals: Code, model graders, and human-in-the-loop are non-negotiable
+### 13. Use RAG-native observability tooling
+
+LangSmith was chosen over MLflow specifically because it understands retrieval pipelines. Each stage is a named trace:
+
+```python
+@traceable(name="pinecone_vector_search")
+@traceable(name="gemini_improve_query")
+@traceable(name="enhanced_retriever_query")
+```
+
+User feedback (thumbs up/down) is linked to specific run IDs via `langsmith_client.create_feedback()`, so you can trace a bad response back to exactly which retrieval step failed.
+
+**File**: `backend/app/retriever.py`, `backend/app/gemini_client.py`, `backend/server.py`
+
+---
+
+### 14. Evals: Code, model graders, and human-in-the-loop are non-negotiable
 
 AI applications don't have deterministic outputs — the same query can return subtly different answers depending on context window changes, model updates, or upstream data drift. Without evals, you have no signal whether things got better or worse after a change.
 
@@ -302,176 +474,6 @@ def export_negative_feedback_as_eval_set(limit: int = 100) -> list[dict]:
 ```
 
 **File**: `eval/test_retrieval.py`, `eval/model_grader.py`, `backend/app/hitl_eval.py`
-
----
-
-### 14. Retrieval accuracy is driven by four compounding decisions — search algorithm and query transformation are the two biggest levers you control at runtime
-
-> **Validation of the claim**: *"Prompt optimisation and search algorithms should be carefully considered for retrieval accuracy."*
->
-> This is **correct**, with one important clarification on terms.
->
-> **Search algorithms — fully correct.** The choice between pure dense vector search, hybrid search (dense + BM25 sparse), and adding a re-ranking pass after initial retrieval are each significant, compounding levers. This codebase currently uses pure cosine similarity on Pinecone. That is the simplest option, not the best option for precision on technical text. Hybrid search consistently outperforms pure dense retrieval on academic papers where exact terminology, acronyms, and author names matter.
->
-> **"Prompt optimisation" — correct, but needs precision.** In the context of *retrieval accuracy specifically*, this means **query transformation**: rewriting, expanding, or decomposing the user's query *before* it reaches the vector database. This codebase already does this with `improve_query()`. What it does not yet do: multi-query retrieval (generate N phrasings, merge results with Reciprocal Rank Fusion) or HyDE (embed a hypothetical answer instead of the raw question — often a better retrieval signal than the question itself). If "prompt optimisation" means tuning the *generation* prompt that produces the final answer, that affects response quality, not retrieval accuracy — a distinct problem.
->
-> **What this framing misses:** chunking strategy and embedding model quality are equally foundational, but they are fixed at index time. At query time, search algorithm and query transformation are the two highest-leverage, adjustable controls over retrieval accuracy. The framing is right about which two things to focus on *during development iteration*.
-
-Retrieval accuracy is the product of four compounding decisions:
-
-| Layer | Set when | Lever |
-|---|---|---|
-| Embedding model | Index time (fixed after) | Semantic quality ceiling — cannot be recovered downstream |
-| Chunking strategy | Index time | Context preserved per chunk vs. retrieval noise |
-| Search algorithm | Query time | Dense-only vs. hybrid vs. re-ranking |
-| Query transformation | Query time | Vocabulary gap between user language and document language |
-
-The bottom two are what you tune during development without rebuilding the index.
-
-#### Search algorithm: hybrid retrieval with Reciprocal Rank Fusion
-
-Pure dense search misses exact-match cases (acronyms, paper titles, author names). BM25 misses semantic cases. Hybrid search with RRF merges both ranked lists without requiring normalised scores.
-
-```python
-# backend/app/hybrid_retriever.py
-from rank_bm25 import BM25Okapi
-
-def reciprocal_rank_fusion(ranked_lists: list, k: int = 60) -> list:
-    """Merge multiple ranked result lists into one using RRF scoring."""
-    scores = {}
-    for ranked in ranked_lists:
-        for rank, item in enumerate(ranked):
-            cid = item["metadata"]["chunk_id"]
-            scores[cid] = scores.get(cid, 0) + 1.0 / (k + rank + 1)
-            scores[cid + "__item"] = item  # store for lookup
-    return sorted(
-        [scores[k + "__item"] for k in scores if not k.endswith("__item")],
-        key=lambda x: scores[x["metadata"]["chunk_id"]],
-        reverse=True,
-    )
-
-class HybridRetriever:
-    """
-    Combines Pinecone dense search with BM25 sparse search.
-    Merge strategy: Reciprocal Rank Fusion (no score normalisation needed).
-    """
-
-    def __init__(self, dense_retriever, corpus_chunks: list):
-        self.dense = dense_retriever
-        tokenized = [chunk["content"].lower().split() for chunk in corpus_chunks]
-        self.bm25 = BM25Okapi(tokenized)
-        self.chunks = corpus_chunks
-
-    def search(self, query: str, k: int = 5, fetch_k: int = 20) -> list:
-        # Dense retrieval — fetch more than k, re-rank will narrow it
-        dense_results = self.dense.query_documents(query, k=fetch_k)
-
-        # Sparse retrieval via BM25
-        tokens = query.lower().split()
-        bm25_scores = self.bm25.get_scores(tokens)
-        sparse_ranked = [
-            self.chunks[i]
-            for i in sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:fetch_k]
-        ]
-
-        # Merge with RRF and return top-k
-        merged = reciprocal_rank_fusion([dense_results, sparse_ranked])
-        return merged[:k]
-```
-
-#### Search algorithm: cross-encoder re-ranking
-
-After retrieving a broad candidate set, a cross-encoder scores each (query, chunk) pair jointly — far more accurate than a bi-encoder similarity score, at the cost of latency. Run it on the top-20 candidates, return the top-5.
-
-```python
-# backend/app/reranker.py
-from sentence_transformers import CrossEncoder
-
-_model = None
-
-def get_reranker() -> CrossEncoder:
-    global _model
-    if _model is None:
-        # Lightweight model — ~80MB, ~50ms for 20 pairs on CPU
-        _model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    return _model
-
-def rerank(query: str, chunks: list, top_n: int = 5) -> list:
-    """
-    Re-rank retrieval candidates using a cross-encoder.
-    chunks: output from dense or hybrid retrieval (fetch 3-4x top_n candidates)
-    """
-    reranker = get_reranker()
-    pairs = [(query, chunk["content"]) for chunk in chunks]
-    scores = reranker.predict(pairs)
-    ranked = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
-    return [chunk for _, chunk in ranked[:top_n]]
-```
-
-#### Query transformation: multi-query retrieval with RRF
-
-A single query phrasing often misses relevant chunks that would match under a different phrasing. Generate N variants, retrieve independently, merge with RRF.
-
-```python
-# backend/app/query_transform.py
-import anthropic
-
-client = anthropic.Anthropic()
-
-def generate_query_variants(query: str, n: int = 3) -> list:
-    """Generate N semantically equivalent phrasings of the query."""
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Generate {n} different ways to phrase this question for searching "
-                f"academic papers. Return only the questions, one per line, no numbering.\n\n"
-                f"Question: {query}"
-            ),
-        }],
-    )
-    lines = response.content[0].text.strip().splitlines()
-    return [query] + [l.strip() for l in lines if l.strip()][:n]
-
-def multi_query_retrieve(query: str, retriever, k: int = 5, n_variants: int = 3) -> list:
-    """
-    Retrieve using N query variants, merge with RRF.
-    Bridges the vocabulary gap between user language and document language.
-    """
-    from backend.app.hybrid_retriever import reciprocal_rank_fusion
-
-    variants = generate_query_variants(query, n=n_variants)
-    ranked_lists = [retriever.query_documents(v, k=k * 2) for v in variants]
-    merged = reciprocal_rank_fusion(ranked_lists)
-    return merged[:k]
-
-def hyde_retrieve(query: str, retriever, k: int = 5) -> list:
-    """
-    HyDE: embed a *hypothetical answer* instead of the raw question.
-    Often a much better retrieval signal — the hypothetical answer lives in
-    the same semantic space as real paper excerpts, the raw question does not.
-    """
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=150,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Write a short excerpt from an academic paper that would answer this question. "
-                f"Write it in a technical, paper-like style.\n\nQuestion: {query}"
-            ),
-        }],
-    )
-    hypothetical_answer = response.content[0].text.strip()
-    # Retrieve using the hypothetical answer as the query
-    return retriever.query_documents(hypothetical_answer, k=k)
-```
-
-**Practical recommendation for this codebase:** The highest-ROI change is adding hybrid search (BM25 + dense with RRF) because academic papers are dense with exact terminology that pure cosine similarity under-weights. Add re-ranking second. Multi-query and HyDE are diminishing returns after those two are in place — measure with `eval/test_retrieval.py` before adding complexity.
-
-**File**: `backend/app/hybrid_retriever.py`, `backend/app/reranker.py`, `backend/app/query_transform.py`
 
 ---
 
