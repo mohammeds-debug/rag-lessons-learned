@@ -305,6 +305,176 @@ def export_negative_feedback_as_eval_set(limit: int = 100) -> list[dict]:
 
 ---
 
+### 14. Retrieval accuracy is driven by four compounding decisions — search algorithm and query transformation are the two biggest levers you control at runtime
+
+> **Validation of the claim**: *"Prompt optimisation and search algorithms should be carefully considered for retrieval accuracy."*
+>
+> This is **correct**, with one important clarification on terms.
+>
+> **Search algorithms — fully correct.** The choice between pure dense vector search, hybrid search (dense + BM25 sparse), and adding a re-ranking pass after initial retrieval are each significant, compounding levers. This codebase currently uses pure cosine similarity on Pinecone. That is the simplest option, not the best option for precision on technical text. Hybrid search consistently outperforms pure dense retrieval on academic papers where exact terminology, acronyms, and author names matter.
+>
+> **"Prompt optimisation" — correct, but needs precision.** In the context of *retrieval accuracy specifically*, this means **query transformation**: rewriting, expanding, or decomposing the user's query *before* it reaches the vector database. This codebase already does this with `improve_query()`. What it does not yet do: multi-query retrieval (generate N phrasings, merge results with Reciprocal Rank Fusion) or HyDE (embed a hypothetical answer instead of the raw question — often a better retrieval signal than the question itself). If "prompt optimisation" means tuning the *generation* prompt that produces the final answer, that affects response quality, not retrieval accuracy — a distinct problem.
+>
+> **What this framing misses:** chunking strategy and embedding model quality are equally foundational, but they are fixed at index time. At query time, search algorithm and query transformation are the two highest-leverage, adjustable controls over retrieval accuracy. The framing is right about which two things to focus on *during development iteration*.
+
+Retrieval accuracy is the product of four compounding decisions:
+
+| Layer | Set when | Lever |
+|---|---|---|
+| Embedding model | Index time (fixed after) | Semantic quality ceiling — cannot be recovered downstream |
+| Chunking strategy | Index time | Context preserved per chunk vs. retrieval noise |
+| Search algorithm | Query time | Dense-only vs. hybrid vs. re-ranking |
+| Query transformation | Query time | Vocabulary gap between user language and document language |
+
+The bottom two are what you tune during development without rebuilding the index.
+
+#### Search algorithm: hybrid retrieval with Reciprocal Rank Fusion
+
+Pure dense search misses exact-match cases (acronyms, paper titles, author names). BM25 misses semantic cases. Hybrid search with RRF merges both ranked lists without requiring normalised scores.
+
+```python
+# backend/app/hybrid_retriever.py
+from rank_bm25 import BM25Okapi
+
+def reciprocal_rank_fusion(ranked_lists: list, k: int = 60) -> list:
+    """Merge multiple ranked result lists into one using RRF scoring."""
+    scores = {}
+    for ranked in ranked_lists:
+        for rank, item in enumerate(ranked):
+            cid = item["metadata"]["chunk_id"]
+            scores[cid] = scores.get(cid, 0) + 1.0 / (k + rank + 1)
+            scores[cid + "__item"] = item  # store for lookup
+    return sorted(
+        [scores[k + "__item"] for k in scores if not k.endswith("__item")],
+        key=lambda x: scores[x["metadata"]["chunk_id"]],
+        reverse=True,
+    )
+
+class HybridRetriever:
+    """
+    Combines Pinecone dense search with BM25 sparse search.
+    Merge strategy: Reciprocal Rank Fusion (no score normalisation needed).
+    """
+
+    def __init__(self, dense_retriever, corpus_chunks: list):
+        self.dense = dense_retriever
+        tokenized = [chunk["content"].lower().split() for chunk in corpus_chunks]
+        self.bm25 = BM25Okapi(tokenized)
+        self.chunks = corpus_chunks
+
+    def search(self, query: str, k: int = 5, fetch_k: int = 20) -> list:
+        # Dense retrieval — fetch more than k, re-rank will narrow it
+        dense_results = self.dense.query_documents(query, k=fetch_k)
+
+        # Sparse retrieval via BM25
+        tokens = query.lower().split()
+        bm25_scores = self.bm25.get_scores(tokens)
+        sparse_ranked = [
+            self.chunks[i]
+            for i in sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:fetch_k]
+        ]
+
+        # Merge with RRF and return top-k
+        merged = reciprocal_rank_fusion([dense_results, sparse_ranked])
+        return merged[:k]
+```
+
+#### Search algorithm: cross-encoder re-ranking
+
+After retrieving a broad candidate set, a cross-encoder scores each (query, chunk) pair jointly — far more accurate than a bi-encoder similarity score, at the cost of latency. Run it on the top-20 candidates, return the top-5.
+
+```python
+# backend/app/reranker.py
+from sentence_transformers import CrossEncoder
+
+_model = None
+
+def get_reranker() -> CrossEncoder:
+    global _model
+    if _model is None:
+        # Lightweight model — ~80MB, ~50ms for 20 pairs on CPU
+        _model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return _model
+
+def rerank(query: str, chunks: list, top_n: int = 5) -> list:
+    """
+    Re-rank retrieval candidates using a cross-encoder.
+    chunks: output from dense or hybrid retrieval (fetch 3-4x top_n candidates)
+    """
+    reranker = get_reranker()
+    pairs = [(query, chunk["content"]) for chunk in chunks]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(scores, chunks), key=lambda x: x[0], reverse=True)
+    return [chunk for _, chunk in ranked[:top_n]]
+```
+
+#### Query transformation: multi-query retrieval with RRF
+
+A single query phrasing often misses relevant chunks that would match under a different phrasing. Generate N variants, retrieve independently, merge with RRF.
+
+```python
+# backend/app/query_transform.py
+import anthropic
+
+client = anthropic.Anthropic()
+
+def generate_query_variants(query: str, n: int = 3) -> list:
+    """Generate N semantically equivalent phrasings of the query."""
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Generate {n} different ways to phrase this question for searching "
+                f"academic papers. Return only the questions, one per line, no numbering.\n\n"
+                f"Question: {query}"
+            ),
+        }],
+    )
+    lines = response.content[0].text.strip().splitlines()
+    return [query] + [l.strip() for l in lines if l.strip()][:n]
+
+def multi_query_retrieve(query: str, retriever, k: int = 5, n_variants: int = 3) -> list:
+    """
+    Retrieve using N query variants, merge with RRF.
+    Bridges the vocabulary gap between user language and document language.
+    """
+    from backend.app.hybrid_retriever import reciprocal_rank_fusion
+
+    variants = generate_query_variants(query, n=n_variants)
+    ranked_lists = [retriever.query_documents(v, k=k * 2) for v in variants]
+    merged = reciprocal_rank_fusion(ranked_lists)
+    return merged[:k]
+
+def hyde_retrieve(query: str, retriever, k: int = 5) -> list:
+    """
+    HyDE: embed a *hypothetical answer* instead of the raw question.
+    Often a much better retrieval signal — the hypothetical answer lives in
+    the same semantic space as real paper excerpts, the raw question does not.
+    """
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=150,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Write a short excerpt from an academic paper that would answer this question. "
+                f"Write it in a technical, paper-like style.\n\nQuestion: {query}"
+            ),
+        }],
+    )
+    hypothetical_answer = response.content[0].text.strip()
+    # Retrieve using the hypothetical answer as the query
+    return retriever.query_documents(hypothetical_answer, k=k)
+```
+
+**Practical recommendation for this codebase:** The highest-ROI change is adding hybrid search (BM25 + dense with RRF) because academic papers are dense with exact terminology that pure cosine similarity under-weights. Add re-ranking second. Multi-query and HyDE are diminishing returns after those two are in place — measure with `eval/test_retrieval.py` before adding complexity.
+
+**File**: `backend/app/hybrid_retriever.py`, `backend/app/reranker.py`, `backend/app/query_transform.py`
+
+---
+
 # Sample Project 
 
 # arXiv RAG
